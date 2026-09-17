@@ -184,6 +184,7 @@ a:hover{color:var(--accent)}
     provider: 'gemini', apiKey: '', keys: {}, llm: 'gemini-3.6-flash', notes: '', linked: false, lastRead: '',
     busy: false, error: '', keyDraft: '', notesDraft: '',
     source: 'onedrive', folderUrl: '', folderDraft: '', files: [], status: '',
+    localName: '',
     font: FONTS[0].stack, ts: 1, voice: 'normal',
     reminders: null, suggestions: null, openId: 2, sheetId: null, flash: '',
     draftTitle: '', draftMin: 780, repeat: 'once', ctx: true,
@@ -211,6 +212,7 @@ a:hover{color:var(--accent)}
       var ok = (PROVIDERS[S.provider] || PROVIDERS.gemini).models, j, good = false;
       for (j = 0; j < ok.length; j++) { if (S.llm === ok[j]) good = true; }
       if (!good) S.llm = ok[0];
+      if (S.source === 'local' && !HAS_FS) S.source = 'paste';
     } catch (e) { /* private mode or corrupt value: fall back to defaults */ }
   }
   function save() {
@@ -221,7 +223,7 @@ a:hover{color:var(--accent)}
         suggestions: S.suggestions, openId: S.openId, repeat: S.repeat,
         ctx: S.ctx, asked: S.asked, notif: S.notif,
         provider: S.provider, apiKey: S.apiKey, keys: S.keys, llm: S.llm, notes: S.notes, linked: S.linked, lastRead: S.lastRead,
-        source: S.source, folderUrl: S.folderUrl, files: S.files
+        source: S.source, folderUrl: S.folderUrl, files: S.files, localName: S.localName
       }));
     } catch (e) { /* storage unavailable: session-only is fine */ }
   }
@@ -338,6 +340,82 @@ a:hover{color:var(--accent)}
 
   var READABLE = /\.(md|markdown|txt|text|csv|json)$/i;
 
+  /* ---------- A folder on this computer ----------
+     The OneDrive sync folder is an ordinary directory on disk, so on a desktop
+     browser the app can read it directly. The handle is kept in IndexedDB, so
+     the folder is only chosen once; permission is re-confirmed on a click. */
+
+  var HAS_FS = typeof window.showDirectoryPicker === 'function';
+
+  function idb(fn, onFail) {
+    var req = window.indexedDB.open('dailybrief', 1);
+    req.onupgradeneeded = function () { req.result.createObjectStore('h'); };
+    req.onerror = function () { onFail('This browser will not remember the folder.'); };
+    req.onsuccess = function () { fn(req.result); };
+  }
+  function handleSave(hd, onDone) {
+    idb(function (db) {
+      var t = db.transaction('h', 'readwrite');
+      t.objectStore('h').put(hd, 'dir');
+      t.oncomplete = function () { onDone(); };
+    }, function () { onDone(); });
+  }
+  function handleLoad(onDone) {
+    if (!HAS_FS || !window.indexedDB) { onDone(null); return; }
+    idb(function (db) {
+      var r = db.transaction('h', 'readonly').objectStore('h').get('dir');
+      r.onsuccess = function () { onDone(r.result || null); };
+      r.onerror = function () { onDone(null); };
+    }, function () { onDone(null); });
+  }
+
+  function readDir(hd, onDone, onFail) {
+    var picked = [];
+    function walk(it) {
+      it.next().then(function (step) {
+        if (step.done) { finish(); return; }
+        var entry = step.value[1] || step.value;
+        if (entry.kind === 'file' && READABLE.test(entry.name) && picked.length < 8) picked.push(entry);
+        walk(it);
+      })['catch'](function () { onFail('Could not list that folder.'); });
+    }
+    function finish() {
+      if (!picked.length) { onFail('No readable text files in that folder (.md, .txt, .csv or .json).'); return; }
+      S.status = 'Reading ' + picked.length + ' file' + (picked.length > 1 ? 's' : '') + '\u2026'; render();
+      var jobs = [], i;
+      for (i = 0; i < picked.length; i++) {
+        jobs.push(picked[i].getFile().then(function (f) {
+          return f.text().then(function (txt) { return '--- ' + f.name + ' ---\n' + txt.slice(0, 12000); });
+        }));
+      }
+      Promise.all(jobs).then(function (texts) {
+        S.files = [];
+        for (var k = 0; k < picked.length; k++) S.files.push(picked[k].name);
+        onDone(texts.join('\n\n'));
+      })['catch'](function () { onFail('Could not read one of the files.'); });
+    }
+    walk(hd.entries());
+  }
+
+  function readLocal(onDone, onFail) {
+    if (!HAS_FS) { onFail('This browser cannot read a local folder. Use Safari on the phone with Paste text, or open this app in Edge or Chrome on your PC.'); return; }
+    handleLoad(function (hd) {
+      if (!hd) { onFail('Choose the folder first.'); return; }
+      S.status = 'Opening the folder\u2026'; render();
+      hd.requestPermission({ mode: 'read' }).then(function (p) {
+        if (p !== 'granted') { onFail('Permission to read the folder was refused.'); return; }
+        readDir(hd, onDone, onFail);
+      })['catch'](function () { onFail('Permission to read the folder was refused.'); });
+    });
+  }
+
+  function pickFolder() {
+    window.showDirectoryPicker({ mode: 'read' }).then(function (hd) {
+      S.localName = hd.name; S.error = ''; S.source = 'local';
+      handleSave(hd, function () { render(); buildBrief(); });
+    })['catch'](function () { /* the picker was dismissed */ });
+  }
+
   function readFolder(onDone, onFail) {
     var url = (S.folderDraft || S.folderUrl || '').replace(/^\s+|\s+$/g, '');
     if (!url) { onFail('Paste the OneDrive share link for the folder.'); return; }
@@ -451,6 +529,16 @@ a:hover{color:var(--accent)}
     if (!key) { S.error = 'Paste your API key first.'; render(); return; }
     S.apiKey = key; if (!S.keys) S.keys = {}; S.keys[S.provider] = key;
     S.error = ''; S.busy = true; S.status = ''; render();
+    if (S.source === 'local') {
+      readLocal(function (text) {
+        S.notes = text;
+        S.status = llmName() + ' is reading it\u2026'; render();
+        extract(text);
+      }, function (msg) {
+        S.busy = false; S.status = ''; S.error = msg; render();
+      });
+      return;
+    }
     if (S.source === 'onedrive') {
       readFolder(function (text) {
         S.notes = text;
@@ -580,19 +668,28 @@ a:hover{color:var(--accent)}
     var keyVal = S.keyDraft || S.apiKey || (S.keys && S.keys[S.provider]) || '';
     var notesVal = S.notesDraft || S.notes || '';
     var folderVal = S.folderDraft || S.folderUrl || '';
-    var od = S.source === 'onedrive';
+    var od = S.source === 'onedrive', lo = S.source === 'local';
     var h = '<div class="scroll"><div class="pad top" style="padding-bottom:40px">' +
       '<div style="display:flex;justify-content:space-between;align-items:center">' +
       '<div class="mono">Connect</div>' +
       (S.linked ? '<button class="dateline" style="padding:0;min-height:36px" data-go="today">Close</button>' : '') +
       '</div>' +
-      '<h2 style="margin-top:16px;font-style:' + S.voice + '">Read my OneDrive<br>folder with ' + esc(llmName()) + '.</h2>' +
+      '<h2 style="margin-top:16px;font-style:' + S.voice + '">Read my notes<br>folder with ' + esc(llmName()) + '.</h2>' +
       '<p class="lede" style="font-size:calc(15px * var(--ts))">Claude projects on claude.ai can\u2019t be read by an outside app, so the folder is the source of truth: Daily Brief reads the text files in it and the model you pick pulls out what you committed to.</p>' +
-      '<div style="display:flex;gap:8px;margin-top:24px">' +
-      '<button class="chip' + (od ? ' on' : '') + '" style="flex:1;padding:0 6px" data-source="onedrive">OneDrive folder</button>' +
-      '<button class="chip' + (od ? '' : ' on') + '" style="flex:1;padding:0 6px" data-source="paste">Paste text</button></div>';
+      '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:24px">' +
+      (HAS_FS ? '<button class="chip' + (lo ? ' on' : '') + '" style="flex:1;padding:0 6px;min-width:130px" data-source="local">Folder on this PC</button>' : '') +
+      '<button class="chip' + (od ? ' on' : '') + '" style="flex:1;padding:0 6px;min-width:130px" data-source="onedrive">OneDrive link</button>' +
+      '<button class="chip' + (!od && !lo ? ' on' : '') + '" style="flex:1;padding:0 6px;min-width:130px" data-source="paste">Paste text</button></div>';
 
-    if (od) {
+    if (lo) {
+      h += '<div style="margin-top:26px"><div class="mono">Folder on this computer</div>' +
+        '<div style="margin-top:10px;font-size:calc(17px * var(--ts));line-height:1.35;font-weight:600">' + esc(S.localName || 'No folder chosen yet') + '</div>' +
+        '<button class="btn btn-o" style="margin-top:14px" data-pick="1">' + (S.localName ? 'Choose a different folder' : 'Choose folder\u2026') + '</button>' +
+        '<div class="src" style="margin-top:12px;line-height:1.7">Point it at your synced OneDrive folder \u2014 D:\\Asman\\OneDrive\\Claude. It reads the files straight off the disk, so no sharing link and no sign-in. The browser remembers the folder; it asks once per session before reading.</div></div>';
+      if (S.files.length) {
+        h += '<div style="margin-top:18px"><div class="mono">Last read</div><div class="src" style="margin-top:8px;line-height:1.7">' + esc(S.files.join(' \u00b7 ')) + '</div></div>';
+      }
+    } else if (od) {
       h += '<div style="margin-top:26px"><div class="mono">Folder share link</div>' +
         '<input id="folder" autocomplete="off" spellcheck="false" value="' + esc(folderVal) + '" placeholder="https://1drv.ms/f/\u2026" style="margin-top:8px;font-size:calc(15px * var(--ts))">' +
         '<div class="src" style="margin-top:10px;line-height:1.7">In OneDrive on the <b>web</b>: open the folder \u2192 Share \u2192 Anyone with the link \u2192 Can view \u2192 Copy. Reads up to 8 files \u2014 .md, .txt, .csv, .json. Work or school accounts usually refuse anonymous reads \u2014 if the link is rejected, use Paste text.</div></div>';
@@ -620,8 +717,8 @@ a:hover{color:var(--accent)}
     h += '</div></div>' +
       (S.status ? '<div class="mono" style="margin-top:22px;color:var(--accent)">' + esc(S.status) + '</div>' : '') +
       (S.error ? '<p style="margin:22px 0 0;font-size:calc(14px * var(--ts));line-height:1.55;color:#8a0045;border-left:2px solid var(--accent-2);padding-left:12px">' + esc(S.error) + '</p>' : '') +
-      '<p style="margin:26px 0 0;font-size:calc(13px * var(--ts));line-height:1.55;color:#6b6663;border-left:2px solid var(--accent);padding-left:12px">Read-only by design. The folder is downloaded, sent to the model, and the answer read back \u2014 nothing is written to OneDrive.</p>' +
-      '<button class="btn btn-p" style="width:100%;margin-top:22px"' + (S.busy ? ' disabled' : '') + ' data-build="1">' + (S.busy ? 'Working\u2026' : (od ? 'Read the folder and build the brief' : 'Read it and build the brief')) + '</button>' +
+      '<p style="margin:26px 0 0;font-size:calc(13px * var(--ts));line-height:1.55;color:#6b6663;border-left:2px solid var(--accent);padding-left:12px">Read-only by design. The files are read, sent to the model, and the answer read back \u2014 nothing is ever written back.</p>' +
+      '<button class="btn btn-p" style="width:100%;margin-top:22px"' + (S.busy ? ' disabled' : '') + ' data-build="1">' + (S.busy ? 'Working\u2026' : (od || lo ? 'Read the folder and build the brief' : 'Read it and build the brief')) + '</button>' +
       (S.linked ? '' : '<button class="link" style="margin-top:14px;color:var(--mut)" data-go="today">Skip \u2014 show me the sample day</button>') +
       '</div></div>';
     return h;
@@ -934,6 +1031,7 @@ a:hover{color:var(--accent)}
     if ((v = attr(t, 'data-llm'))) { S.llm = v; render(); return; }
     if ((v = attr(t, 'data-source'))) { S.source = v; S.error = ''; render(); return; }
     if (attr(t, 'data-refresh')) { S.screen = 'link'; buildBrief(); return; }
+    if (attr(t, 'data-pick')) { pickFolder(); return; }
     if (attr(t, 'data-build')) { buildBrief(); return; }
     if (attr(t, 'data-unlink')) {
       S.linked = false; S.notes = ''; S.notesDraft = ''; S.asked = []; S.files = [];
